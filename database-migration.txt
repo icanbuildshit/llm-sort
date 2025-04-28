@@ -1,0 +1,389 @@
+#!/bin/bash
+# scripts/verify-db-compatibility.sh
+# Validates database schema compatibility between Blue and Green environments
+
+set -e
+set -o pipefail
+
+echo "Verifying database schema compatibility between Blue and Green environments..."
+
+# Get current environment and stage
+ENVIRONMENT=${1:-production}
+STAGE=${2:-green}
+DB_HOST=$(aws ssm get-parameter --name "/dynagendashv1/${ENVIRONMENT}/${STAGE}/db_host" --with-decryption | jq -r '.Parameter.Value')
+DB_NAME=$(aws ssm get-parameter --name "/dynagendashv1/${ENVIRONMENT}/${STAGE}/db_name" --with-decryption | jq -r '.Parameter.Value')
+DB_USER=$(aws ssm get-parameter --name "/dynagendashv1/${ENVIRONMENT}/${STAGE}/db_user" --with-decryption | jq -r '.Parameter.Value')
+DB_PASSWORD=$(aws ssm get-parameter --name "/dynagendashv1/${ENVIRONMENT}/${STAGE}/db_password" --with-decryption | jq -r '.Parameter.Value')
+
+# Get schema migration version from both Blue and Green environments
+BLUE_VERSION=$(PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -U $DB_USER -d $DB_NAME -t -c "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1;")
+GREEN_VERSION=$(PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -U $DB_USER -d $DB_NAME -t -c "SELECT version FROM schema_migrations_green ORDER BY version DESC LIMIT 1;")
+
+echo "Blue schema version: $BLUE_VERSION"
+echo "Green schema version: $GREEN_VERSION"
+
+# Compare and validate versions
+if [[ -z "$BLUE_VERSION" ]]; then
+  echo "ERROR: Could not determine Blue schema version. Verification failed."
+  exit 1
+fi
+
+if [[ -z "$GREEN_VERSION" ]]; then
+  echo "ERROR: Could not determine Green schema version. Verification failed."
+  exit 1
+fi
+
+# Ensure Green version is same or newer than Blue
+if [[ "$GREEN_VERSION" < "$BLUE_VERSION" ]]; then
+  echo "ERROR: Green schema ($GREEN_VERSION) is older than Blue schema ($BLUE_VERSION). Verification failed."
+  exit 1
+fi
+
+# Validate compatibility through test queries (if different versions)
+if [[ "$GREEN_VERSION" != "$BLUE_VERSION" ]]; then
+  echo "Testing backward compatibility of Green schema with Blue application..."
+  
+  # Run compatibility tests
+  npm run test:db-compatibility -- --environment=$ENVIRONMENT --stage=$STAGE
+  TEST_RESULT=$?
+  
+  if [ $TEST_RESULT -ne 0 ]; then
+    echo "ERROR: Database compatibility tests failed."
+    exit 1
+  fi
+fi
+
+echo "Database schema compatibility verification completed successfully."
+exit 0
+
+# scripts/migrate-database.sh
+# Handles database migrations for Blue-Green deployments
+
+set -e
+set -o pipefail
+
+ENVIRONMENT=${1:-production}
+STAGE=${2:-green}
+
+echo "Performing database migration for environment: $ENVIRONMENT, stage: $STAGE"
+
+# Load database connection details from parameter store
+DB_HOST=$(aws ssm get-parameter --name "/dynagendashv1/${ENVIRONMENT}/${STAGE}/db_host" --with-decryption | jq -r '.Parameter.Value')
+DB_NAME=$(aws ssm get-parameter --name "/dynagendashv1/${ENVIRONMENT}/${STAGE}/db_name" --with-decryption | jq -r '.Parameter.Value')
+DB_USER=$(aws ssm get-parameter --name "/dynagendashv1/${ENVIRONMENT}/${STAGE}/db_user" --with-decryption | jq -r '.Parameter.Value')
+DB_PASSWORD=$(aws ssm get-parameter --name "/dynagendashv1/${ENVIRONMENT}/${STAGE}/db_password" --with-decryption | jq -r '.Parameter.Value')
+DEPLOYMENT_ID=$(date +%Y%m%d%H%M%S)
+
+# Create backup before migration
+echo "Creating database backup before migration..."
+BACKUP_FILE="db_backup_${ENVIRONMENT}_${STAGE}_${DEPLOYMENT_ID}.sql"
+PGPASSWORD=$DB_PASSWORD pg_dump -h $DB_HOST -U $DB_USER -d $DB_NAME -f $BACKUP_FILE
+
+# Upload backup to S3
+aws s3 cp $BACKUP_FILE s3://dynagen-db-backups/$ENVIRONMENT/$BACKUP_FILE
+echo "Backup created and uploaded to S3: s3://dynagen-db-backups/$ENVIRONMENT/$BACKUP_FILE"
+
+# Run database migrations
+echo "Running database migrations..."
+DB_HOST=$DB_HOST DB_NAME=$DB_NAME DB_USER=$DB_USER DB_PASSWORD=$DB_PASSWORD npm run migrate:up
+
+# Update database version tracking
+VERSION=$(date +%Y%m%d%H%M%S)
+PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -U $DB_USER -d $DB_NAME -c "INSERT INTO schema_migrations_$STAGE (version, executed_at) VALUES ('$VERSION', NOW());"
+
+echo "Database migration completed successfully."
+exit 0
+
+# migrations/20250426120000_create_backward_compatible_views.js
+/**
+ * This migration creates views for backward compatibility
+ * to support blue-green deployments where older code
+ * might still access tables with the old schema
+ */
+
+exports.up = function(knex) {
+  return knex.schema
+    // Create compatibility view for user profiles with new fields
+    .raw(`
+      CREATE OR REPLACE VIEW user_profiles_backward_compatible AS
+      SELECT
+        id,
+        user_id,
+        display_name,
+        avatar_url,
+        created_at,
+        updated_at,
+        '' as deprecated_field1,
+        NULL as deprecated_field2
+      FROM user_profiles;
+    `)
+    // Create compatibility view for call_records with restructured fields
+    .raw(`
+      CREATE OR REPLACE VIEW call_records_backward_compatible AS
+      SELECT
+        id,
+        user_id,
+        call_id,
+        -- Map new categorization_type + categorization_value to old category
+        CASE 
+          WHEN categorization_type = 'lead_quality' AND categorization_value >= 8 THEN 'hot_lead'
+          WHEN categorization_type = 'lead_quality' AND categorization_value >= 5 THEN 'warm_lead'
+          WHEN categorization_type = 'lead_quality' THEN 'cold_lead'
+          ELSE categorization_type
+        END as category,
+        started_at,
+        ended_at,
+        duration_seconds,
+        NULL as old_metadata_column,
+        metadata::text as raw_metadata,
+        created_at,
+        updated_at
+      FROM call_records;
+    `)
+    // Create compatibility function for the old API of processing audio
+    .raw(`
+      CREATE OR REPLACE FUNCTION process_audio_v1(
+        p_audio_file_path TEXT,
+        p_user_id INTEGER,
+        p_metadata JSONB
+      ) RETURNS INTEGER AS $$
+      DECLARE
+        v_result_id INTEGER;
+      BEGIN
+        -- Call the new function with parameter mapping
+        INSERT INTO audio_processing_results (
+          user_id,
+          audio_source_path,
+          processing_settings,
+          status,
+          created_at
+        ) VALUES (
+          p_user_id,
+          p_audio_file_path,
+          p_metadata,
+          'queued',
+          NOW()
+        ) RETURNING id INTO v_result_id;
+        
+        -- Queue actual processing using the new system
+        PERFORM pg_notify('audio_processing_queue', v_result_id::text);
+        
+        RETURN v_result_id;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+};
+
+exports.down = function(knex) {
+  return knex.schema
+    .raw('DROP VIEW IF EXISTS user_profiles_backward_compatible')
+    .raw('DROP VIEW IF EXISTS call_records_backward_compatible')
+    .raw('DROP FUNCTION IF EXISTS process_audio_v1');
+};
+
+/**
+ * @file db-compatibility.test.js
+ * Compatibility tests for database migrations
+ * Tests that the old (Blue) application code can still work with
+ * the new (Green) database schema
+ */
+
+const knex = require('knex');
+const { getDbConfig } = require('../src/config/database');
+
+// Query patterns from the Blue application that must still work
+const blueAppQueries = [
+  {
+    name: 'Get user profile with old fields',
+    query: 'SELECT id, user_id, display_name, avatar_url, deprecated_field1, deprecated_field2 FROM user_profiles_backward_compatible WHERE user_id = ?',
+    params: [1],
+    validator: (result) => {
+      return result && result.length > 0 && result[0].display_name && result[0].hasOwnProperty('deprecated_field1');
+    }
+  },
+  {
+    name: 'Get call records with old category field',
+    query: 'SELECT id, user_id, call_id, category, started_at, ended_at, duration_seconds, old_metadata_column, raw_metadata FROM call_records_backward_compatible WHERE user_id = ? ORDER BY started_at DESC LIMIT 10',
+    params: [1],
+    validator: (result) => {
+      return result && result.length > 0 && result[0].hasOwnProperty('category') && result[0].hasOwnProperty('old_metadata_column');
+    }
+  },
+  {
+    name: 'Call audio processing with old API',
+    query: 'SELECT process_audio_v1(?, ?, ?::jsonb)',
+    params: ['/tmp/test-audio.wav', 1, JSON.stringify({ quality: 'high', source: 'phone' })],
+    validator: (result) => {
+      return result && result.length > 0 && result[0]['process_audio_v1'] > 0;
+    }
+  }
+];
+
+describe('Database Compatibility Tests', () => {
+  let db;
+  
+  beforeAll(async () => {
+    // Get database configuration from environment or params
+    const dbConfig = getDbConfig();
+    db = knex(dbConfig);
+  });
+  
+  afterAll(async () => {
+    await db.destroy();
+  });
+  
+  // Test each query pattern from the Blue application
+  blueAppQueries.forEach(queryTest => {
+    test(queryTest.name, async () => {
+      const result = await db.raw(queryTest.query, queryTest.params);
+      const rows = result.rows || result;
+      expect(queryTest.validator(rows)).toBe(true);
+    });
+  });
+  
+  // Test for potential data loss - verify that all important fields are preserved
+  test('No data loss in user profiles', async () => {
+    // Compare record counts
+    const oldTableCount = await db.raw('SELECT COUNT(*) FROM user_profiles');
+    const compatViewCount = await db.raw('SELECT COUNT(*) FROM user_profiles_backward_compatible');
+    
+    expect(parseInt(oldTableCount.rows[0].count)).toBe(parseInt(compatViewCount.rows[0].count));
+    
+    // Sample check of important fields
+    const sampleRecord = await db.raw('SELECT * FROM user_profiles ORDER BY id LIMIT 1');
+    const sampleCompatRecord = await db.raw('SELECT * FROM user_profiles_backward_compatible WHERE id = ?', [sampleRecord.rows[0].id]);
+    
+    expect(sampleRecord.rows[0].user_id).toBe(sampleCompatRecord.rows[0].user_id);
+    expect(sampleRecord.rows[0].display_name).toBe(sampleCompatRecord.rows[0].display_name);
+  });
+});
+
+// db-compatibility-test.js
+// Simple Node.js script to test database backward compatibility
+
+const { Pool } = require('pg');
+const AWS = require('aws-sdk');
+const yargs = require('yargs/yargs');
+const { hideBin } = require('yargs/helpers');
+
+// Parse command line arguments
+const argv = yargs(hideBin(process.argv))
+  .option('environment', {
+    alias: 'e',
+    type: 'string',
+    description: 'Environment (development, staging, production)',
+    default: 'production'
+  })
+  .option('stage', {
+    alias: 's',
+    type: 'string',
+    description: 'Deployment stage (blue, green)',
+    default: 'green'
+  })
+  .help()
+  .argv;
+
+async function runCompatibilityTests() {
+  const ssm = new AWS.SSM();
+  
+  // Get database connection parameters from SSM
+  const getParameter = async (name) => {
+    const result = await ssm.getParameter({
+      Name: `/dynagendashv1/${argv.environment}/${argv.stage}/${name}`,
+      WithDecryption: true
+    }).promise();
+    return result.Parameter.Value;
+  };
+  
+  const dbHost = await getParameter('db_host');
+  const dbName = await getParameter('db_name');
+  const dbUser = await getParameter('db_user');
+  const dbPassword = await getParameter('db_password');
+  
+  // Create database connection
+  const pool = new Pool({
+    host: dbHost,
+    database: dbName,
+    user: dbUser,
+    password: dbPassword,
+    port: 5432,
+  });
+  
+  try {
+    console.log('Running compatibility tests...');
+    
+    // Test 1: Check if backward compatibility views exist
+    console.log('Test 1: Verifying compatibility views exist...');
+    const viewCheck = await pool.query(`
+      SELECT table_name
+      FROM information_schema.views
+      WHERE table_schema = 'public'
+        AND table_name IN ('user_profiles_backward_compatible', 'call_records_backward_compatible');
+    `);
+    
+    if (viewCheck.rows.length !== 2) {
+      console.error('ERROR: Compatibility views not found');
+      process.exit(1);
+    }
+    
+    // Test 2: Verify old queries still work
+    console.log('Test 2: Verifying old query patterns...');
+    
+    // Old query pattern 1: Select from user_profiles with old field names
+    const userQuery = await pool.query(`
+      SELECT id, user_id, display_name, avatar_url, deprecated_field1, deprecated_field2 
+      FROM user_profiles_backward_compatible 
+      LIMIT 1;
+    `);
+    
+    if (userQuery.rows.length === 0) {
+      console.error('ERROR: User profiles compatibility query failed');
+      process.exit(1);
+    }
+    
+    // Old query pattern 2: Select from call_records with old category field
+    const callQuery = await pool.query(`
+      SELECT id, user_id, call_id, category, started_at, ended_at 
+      FROM call_records_backward_compatible 
+      LIMIT 1;
+    `);
+    
+    if (callQuery.rows.length === 0) {
+      console.error('ERROR: Call records compatibility query failed');
+      process.exit(1);
+    }
+    
+    // Test 3: Verify old stored procedures still work
+    console.log('Test 3: Verifying stored procedure compatibility...');
+    const procQuery = await pool.query(`
+      SELECT proname 
+      FROM pg_proc 
+      WHERE proname = 'process_audio_v1';
+    `);
+    
+    if (procQuery.rows.length === 0) {
+      console.error('ERROR: Backward compatible stored procedures not found');
+      process.exit(1);
+    }
+    
+    // Test stored procedure execution
+    const procExec = await pool.query(`
+      SELECT process_audio_v1('/test/path', 1, '{"quality": "high"}'::jsonb);
+    `);
+    
+    if (!procExec.rows[0].process_audio_v1) {
+      console.error('ERROR: process_audio_v1 function execution failed');
+      process.exit(1);
+    }
+    
+    console.log('All compatibility tests passed successfully!');
+    process.exit(0);
+  } catch (error) {
+    console.error('ERROR during compatibility tests:', error.message);
+    process.exit(1);
+  } finally {
+    await pool.end();
+  }
+}
+
+runCompatibilityTests();

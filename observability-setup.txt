@@ -1,0 +1,939 @@
+// src/services/monitoring.ts
+
+import * as Sentry from '@sentry/react';
+import { BrowserTracing } from '@sentry/tracing';
+import { createRoutesFromChildren, matchRoutes } from 'react-router-dom';
+import { useLocation, useNavigationType } from 'react-router-dom';
+import config from '../config';
+
+/**
+ * Initialize error tracking with Sentry
+ * Sets up transaction monitoring for React Router and performance tracking
+ */
+export const initErrorTracking = () => {
+  if (import.meta.env.PROD) {
+    Sentry.init({
+      dsn: config.sentryDsn,
+      environment: import.meta.env.MODE,
+      release: `dynagendashv1@${import.meta.env.VITE_APP_VERSION || '1.0.0'}`,
+      // Only sample a percentage of transactions for performance monitoring
+      tracesSampleRate: 0.1, 
+      // Increase for error events to ensure critical issues are captured
+      sampleRate: 1.0,
+      // Maximum number of breadcrumbs to capture
+      maxBreadcrumbs: 50,
+      // Add React Router instrumentation
+      integrations: [
+        new BrowserTracing({
+          routingInstrumentation: Sentry.reactRouterV6Instrumentation(
+            React.useEffect,
+            useLocation,
+            useNavigationType,
+            createRoutesFromChildren,
+            matchRoutes
+          ),
+        }),
+      ],
+      // Don't send PII to comply with privacy policies
+      sendDefaultPii: false,
+      // Normalize URLs to group similar errors
+      normalizeDepth: 3,
+      beforeSend(event) {
+        // Sanitize any sensitive data before sending
+        if (event.request && event.request.headers) {
+          delete event.request.headers.Authorization;
+          delete event.request.headers.Cookie;
+        }
+        
+        // Filter out known third-party script errors
+        if (event.exception && event.exception.values) {
+          const value = event.exception.values[0];
+          if (value.type === 'Error' && 
+              (value.value.includes('Script error') || 
+               value.value.includes('ChunkLoadError'))) {
+            return null;
+          }
+        }
+        
+        return event;
+      }
+    });
+    
+    // Set user context if available
+    const user = localStorage.getItem('user');
+    if (user) {
+      try {
+        const parsedUser = JSON.parse(user);
+        Sentry.setUser({ 
+          id: parsedUser.id,
+          // Deliberately exclude personal information
+          role: parsedUser.role
+        });
+      } catch (e) {
+        console.error('Failed to parse user info for Sentry');
+      }
+    }
+  }
+};
+
+/**
+ * Custom error logger that sends to both console and Sentry in production
+ */
+export const logError = (error: Error, context?: Record<string, any>) => {
+  console.error(error);
+  
+  if (import.meta.env.PROD) {
+    Sentry.withScope((scope) => {
+      if (context) {
+        Object.entries(context).forEach(([key, value]) => {
+          scope.setExtra(key, value);
+        });
+      }
+      Sentry.captureException(error);
+    });
+  }
+};
+
+/**
+ * Track custom events for business intelligence
+ */
+export const trackEvent = (
+  category: string, 
+  action: string, 
+  label?: string, 
+  value?: number,
+  properties?: Record<string, any>
+) => {
+  if (import.meta.env.PROD && config.analyticsId) {
+    // Send to Google Analytics (if implemented)
+    if (window.gtag) {
+      window.gtag('event', action, {
+        event_category: category,
+        event_label: label,
+        value: value
+      });
+    }
+    
+    // Also track in Sentry for correlation with errors
+    Sentry.addBreadcrumb({
+      category,
+      message: action,
+      data: {
+        label,
+        value,
+        ...properties
+      },
+      level: 'info'
+    });
+  }
+};
+
+/**
+ * Performance measurement utility 
+ * Use for tracking critical operations in the application
+ */
+export const measurePerformance = async <T>(
+  operationName: string, 
+  operation: () => Promise<T> | T
+): Promise<T> => {
+  // Create a transaction for this operation
+  const transaction = Sentry.startTransaction({
+    name: `perf:${operationName}`,
+    op: 'measure'
+  });
+  
+  try {
+    // Time the operation
+    const start = performance.now();
+    const result = await operation();
+    const duration = performance.now() - start;
+    
+    // Record custom metric
+    if (window.dataLayer) {
+      window.dataLayer.push({
+        event: 'performance',
+        metricName: operationName,
+        metricValue: Math.round(duration)
+      });
+    }
+    
+    // Add operation data to the transaction
+    transaction.setData('duration_ms', duration);
+    
+    // Log significant performance issues locally
+    if (duration > 1000) {
+      console.warn(`Slow operation: ${operationName} took ${duration.toFixed(2)}ms`);
+    }
+    
+    return result;
+  } catch (error) {
+    // Capture both the error and performance data
+    transaction.setStatus('internal_error');
+    transaction.setData('error', error);
+    throw error;
+  } finally {
+    // Always finish the transaction
+    transaction.finish();
+  }
+};
+
+/**
+ * Audio processing specific metrics
+ */
+export const audioMetrics = {
+  startProcessing: (callId: string) => {
+    const span = Sentry.startSpan({
+      name: 'audio_processing',
+      data: { callId }
+    });
+    return () => span.finish();
+  },
+  
+  recordLatency: (operation: string, durationMs: number) => {
+    if (window.prometheus && window.prometheus.metrics) {
+      // Send to Prometheus if client-side exporter is configured
+      window.prometheus.metrics.observeHistogram(
+        'audio_processing_duration_seconds',
+        durationMs / 1000,
+        { operation }
+      );
+    }
+    
+    // Also log to Sentry for correlation with errors
+    Sentry.addBreadcrumb({
+      category: 'performance',
+      message: `Audio operation: ${operation}`,
+      data: { durationMs },
+      level: 'info'
+    });
+  }
+};
+
+// server/src/middleware/metrics.ts
+
+import promClient from 'prom-client';
+import express from 'express';
+
+// Create a Registry for prom-client
+const register = new promClient.Registry();
+
+// Add default metrics (CPU, memory, etc.)
+promClient.collectDefaultMetrics({ register });
+
+// Create custom metrics
+const httpRequestDurationMicroseconds = new promClient.Histogram({
+  name: 'http_request_duration_ms',
+  help: 'Duration of HTTP requests in ms',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
+});
+register.registerMetric(httpRequestDurationMicroseconds);
+
+// Custom call metrics
+const activeCalls = new promClient.Gauge({
+  name: 'active_calls',
+  help: 'Number of currently active calls'
+});
+register.registerMetric(activeCalls);
+
+const callDuration = new promClient.Histogram({
+  name: 'call_duration_seconds',
+  help: 'Duration of calls in seconds',
+  buckets: [10, 30, 60, 120, 300, 600, 1200]
+});
+register.registerMetric(callDuration);
+
+// Audio analysis specific metrics
+const audioAnalysisLatency = new promClient.Histogram({
+  name: 'audio_analysis_latency_seconds',
+  help: 'Time taken to analyze audio segments',
+  labelNames: ['type', 'quality'],
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 30]
+});
+register.registerMetric(audioAnalysisLatency);
+
+const audioAnalysisErrorRate = new promClient.Counter({
+  name: 'audio_analysis_errors_total',
+  help: 'Number of audio analysis errors',
+  labelNames: ['error_type']
+});
+register.registerMetric(audioAnalysisErrorRate);
+
+// Queue metrics
+const audioQueueLength = new promClient.Gauge({
+  name: 'audio_queue_length',
+  help: 'Number of audio segments waiting for analysis'
+});
+register.registerMetric(audioQueueLength);
+
+const audioQueueWaitTime = new promClient.Histogram({
+  name: 'audio_queue_wait_time_seconds',
+  help: 'Time spent in queue before processing',
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60]
+});
+register.registerMetric(audioQueueWaitTime);
+
+// Business metrics
+const loanApplications = new promClient.Counter({
+  name: 'loan_applications_total',
+  help: 'Number of loan applications submitted',
+  labelNames: ['status', 'channel']
+});
+register.registerMetric(loanApplications);
+
+const loanApprovalTime = new promClient.Histogram({
+  name: 'loan_approval_time_hours',
+  help: 'Time taken to approve or deny loans',
+  labelNames: ['decision'],
+  buckets: [1, 4, 8, 24, 48, 72, 96, 120]
+});
+register.registerMetric(loanApprovalTime);
+
+// Middleware to track HTTP request durations
+export const metricsMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const end = httpRequestDurationMicroseconds.startTimer();
+  res.on('finish', () => {
+    end({
+      method: req.method,
+      route: req.route?.path || req.path,
+      status_code: res.statusCode
+    });
+  });
+  next();
+};
+
+// Endpoint to expose metrics
+export const metricsEndpoint = async (_req: express.Request, res: express.Response) => {
+  res.setHeader('Content-Type', register.contentType);
+  res.end(await register.metrics());
+};
+
+// API to track call activity
+export const incrementActiveCalls = () => activeCalls.inc();
+export const decrementActiveCalls = () => activeCalls.dec();
+export const recordCallDuration = (durationSeconds: number) => callDuration.observe(durationSeconds);
+
+// Audio metrics API
+export const recordAudioAnalysisLatency = (type: string, quality: string, seconds: number) => {
+  audioAnalysisLatency.observe({ type, quality }, seconds);
+};
+
+export const incrementAudioAnalysisError = (errorType: string) => {
+  audioAnalysisErrorRate.inc({ error_type: errorType });
+};
+
+export const updateAudioQueueLength = (length: number) => {
+  audioQueueLength.set(length);
+};
+
+export const recordAudioQueueWaitTime = (seconds: number) => {
+  audioQueueWaitTime.observe(seconds);
+};
+
+// Business metrics API
+export const recordLoanApplication = (status: string, channel: string) => {
+  loanApplications.inc({ status, channel });
+};
+
+export const recordLoanApprovalTime = (decision: string, hours: number) => {
+  loanApprovalTime.observe({ decision }, hours);
+};
+
+// infra/grafana/dashboards/audio-pipeline-dashboard.json
+
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": "Prometheus",
+        "enable": true,
+        "expr": "changes(dynagen_deployments_total[1m]) > 0",
+        "iconColor": "rgba(255, 96, 96, 1)",
+        "name": "Deployments",
+        "titleFormat": "Deployment"
+      }
+    ]
+  },
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": 1,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "datasource": null,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 12,
+      "panels": [],
+      "title": "Audio Pipeline Overview",
+      "type": "row"
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "fill": 1,
+      "fillGradient": 0,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "hiddenSeries": false,
+      "id": 2,
+      "legend": {
+        "avg": false,
+        "current": true,
+        "max": true,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": true
+      },
+      "lines": true,
+      "linewidth": 1,
+      "nullPointMode": "null",
+      "options": {
+        "alertThreshold": true
+      },
+      "percentage": false,
+      "pluginVersion": "7.3.0",
+      "pointradius": 2,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "active_calls",
+          "interval": "",
+          "legendFormat": "Active Calls",
+          "refId": "A"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Active Calls",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": "0",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": "Prometheus",
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "fill": 1,
+      "fillGradient": 0,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "hiddenSeries": false,
+      "id": 4,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "nullPointMode": "null",
+      "options": {
+        "alertThreshold": true
+      },
+      "percentage": false,
+      "pluginVersion": "7.3.0",
+      "pointradius": 2,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(audio_analysis_latency_seconds_bucket[5m])) by (le, type))",
+          "interval": "",
+          "legendFormat": "{{type}} - p95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(audio_analysis_latency_seconds_bucket[5m])) by (le, type))",
+          "interval": "",
+          "legendFormat": "{{type}} - p50",
+          "refId": "B"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Audio Analysis Latency",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "s",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": "0",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 25
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 6,
+        "x": 0,
+        "y": 9
+      },
+      "id": 6,
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "text": {}
+      },
+      "pluginVersion": "7.3.0",
+      "targets": [
+        {
+          "expr": "audio_queue_length",
+          "interval": "",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "timeFrom": null,
+      "timeShift": null,
+      "title": "Audio Queue Length",
+      "type": "gauge"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 6,
+        "x": 6,
+        "y": 9
+      },
+      "id": 8,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "mean"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "7.3.0",
+      "targets": [
+        {
+          "expr": "sum(rate(audio_analysis_errors_total[5m])) / sum(rate(audio_analysis_latency_seconds_count[5m]))",
+          "interval": "",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "timeFrom": null,
+      "timeShift": null,
+      "title": "Audio Analysis Error Rate",
+      "type": "stat"
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "fill": 1,
+      "fillGradient": 0,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "hiddenSeries": false,
+      "id": 10,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "nullPointMode": "null",
+      "options": {
+        "alertThreshold": true
+      },
+      "percentage": false,
+      "pluginVersion": "7.3.0",
+      "pointradius": 2,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(audio_queue_wait_time_seconds_bucket[5m])) by (le))",
+          "interval": "",
+          "legendFormat": "p95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(audio_queue_wait_time_seconds_bucket[5m])) by (le))",
+          "interval": "",
+          "legendFormat": "p50",
+          "refId": "B"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Audio Queue Wait Time",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "s",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": "0",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 26,
+  "style": "dark",
+  "tags": [
+    "audio",
+    "pipeline",
+    "dynagen"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "30m",
+      "1h",
+      "2h",
+      "1d"
+    ]
+  },
+  "timezone": "",
+  "title": "DynaGen Audio Pipeline",
+  "uid": "dynagen-audio-pipeline",
+  "version": 1
+}
+
+// infra/alertmanager/alerts.yml
+
+groups:
+- name: dynagen-alerts
+  rules:
+  - alert: HighErrorRate
+    expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05
+    for: 2m
+    labels:
+      severity: critical
+      team: platform
+    annotations:
+      summary: "High error rate detected"
+      description: "More than 5% of requests are failing with 5xx errors for the past 2 minutes"
+      dashboard_url: "https://grafana.dynagenlending.com/d/main/dynagen-dashboard-overview"
+
+  - alert: APIHighLatency
+    expr: histogram_quantile(0.95, sum(rate(http_request_duration_ms_bucket[5m])) by (le, route)) > 1000
+    for: 5m
+    labels:
+      severity: warning
+      team: platform
+    annotations:
+      summary: "High API latency detected"
+      description: "95th percentile latency for {{ $labels.route }} is above 1 second for the past 5 minutes"
+      dashboard_url: "https://grafana.dynagenlending.com/d/api/dynagen-api-performance"
+
+  - alert: AudioAnalysisHighLatency
+    expr: histogram_quantile(0.95, sum(rate(audio_analysis_latency_seconds_bucket[5m])) by (le, type)) > 15
+    for: 5m
+    labels:
+      severity: warning
+      team: audio
+    annotations:
+      summary: "High audio analysis latency"
+      description: "95th percentile latency for {{ $labels.type }} audio analysis is above 15 seconds for the past 5 minutes"
+      dashboard_url: "https://grafana.dynagenlending.com/d/audio/dynagen-audio-pipeline"
+
+  - alert: AudioQueueBacklog
+    expr: audio_queue_length > 50
+    for: 10m
+    labels:
+      severity: warning
+      team: audio
+    annotations:
+      summary: "Audio processing queue backlog"
+      description: "Audio processing queue has more than 50 pending items for over 10 minutes"
+      dashboard_url: "https://grafana.dynagenlending.com/d/audio/dynagen-audio-pipeline"
+
+  - alert: AudioAnalysisHighErrorRate
+    expr: sum(rate(audio_analysis_errors_total[5m])) / sum(rate(audio_analysis_latency_seconds_count[5m])) > 0.10
+    for: 5m
+    labels:
+      severity: critical
+      team: audio
+    annotations:
+      summary: "High audio analysis error rate"
+      description: "More than 10% of audio analysis operations are failing for the past 5 minutes"
+      dashboard_url: "https://grafana.dynagenlending.com/d/audio/dynagen-audio-pipeline"
+
+  - alert: AudioProcessingPipeline_Down
+    expr: up{job="audio-processor"} == 0
+    for: 2m
+    labels:
+      severity: critical
+      team: audio
+    annotations:
+      summary: "Audio processing pipeline is down"
+      description: "The audio processing pipeline has been down for more than 2 minutes"
+      runbook_url: "https://wiki.dynagenlending.com/runbooks/audio-pipeline-recovery"
+
+  - alert: NodeHighCPU
+    expr: avg by(instance) (node_cpu_seconds_total{mode="idle"}) > 0.8
+    for: 10m
+    labels:
+      severity: warning
+      team: platform
+    annotations:
+      summary: "High CPU utilization on node"
+      description: "Node {{ $labels.instance }} has CPU utilization above 80% for more than 10 minutes"
+      dashboard_url: "https://grafana.dynagenlending.com/d/node/node-exporter-full"
+
+  - alert: NodeLowMemory
+    expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.1
+    for: 5m
+    labels:
+      severity: warning
+      team: platform
+    annotations:
+      summary: "Low memory on node"
+      description: "Node {{ $labels.instance }} has less than 10% available memory for more than 5 minutes"
+      dashboard_url: "https://grafana.dynagenlending.com/d/node/node-exporter-full"
+
+  - alert: NodeLowDiskSpace
+    expr: node_filesystem_free_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} < 0.15
+    for: 10m
+    labels:
+      severity: warning
+      team: platform
+    annotations:
+      summary: "Low disk space on node"
+      description: "Node {{ $labels.instance }} has less than 15% free disk space on the root filesystem for more than 10 minutes"
+      dashboard_url: "https://grafana.dynagenlending.com/d/node/node-exporter-full"

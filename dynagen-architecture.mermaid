@@ -1,0 +1,97 @@
+graph TD
+    %% Client/Frontend Layer
+    subgraph "Frontend Layer"
+        UI[React UI Dashboard]
+        CALL[Call Interface]
+        AUDIOVIS[Audio Visualization]
+        METRICS[Real-time Metrics]
+        ALERTS[Alert System]
+    end
+
+    %% Application Layer
+    subgraph "Application Layer"
+        API[Node.js API Gateway]
+        WS[WebSocket Server]
+        AUTHSVC[Authentication Service]
+        CALLCTRL[Call Control Service]
+        AUDSVC[Audio Processing Service]
+        LLMPROXY[LLM Proxy Service]
+    end
+
+    %% AI Processing Layer
+    subgraph "AI Processing Layer"
+        subgraph "Audio Analysis Pipeline"
+            DSP[Digital Signal Processor]
+            FEAT[Feature Extraction]
+            SENT[Sentiment Analysis]
+            PATTERN[Pattern Recognition]
+        end
+        
+        subgraph "LLM Swarm"
+            ROUTER[Model Router]
+            SCREEN[Loan Screening Model]
+            INSIGHT[Call Insights Model]
+            RISK[Risk Assessment Model]
+            BEHAV[Behavioral Analytics Model]
+        end
+    end
+
+    %% Data Layer
+    subgraph "Data Layer"
+        CALLDB[(Call Recordings DB)]
+        LOANDB[(Loan Applications DB)]
+        METRICDB[(Performance Metrics DB)]
+        MODELDB[(Model Cache DB)]
+        USERDB[(User Profiles DB)]
+    end
+
+    %% Integrations
+    subgraph "External Integrations"
+        DIALER[Auto Dialer System]
+        CRM[CRM System]
+        REPORTING[Reporting Tools]
+    end
+
+    %% Flow Connections - Frontend to Application
+    UI --> API
+    CALL --> WS
+    UI --> WS
+    
+    %% Flow Connections - Application to AI
+    API --> LLMPROXY
+    WS --> AUDSVC
+    CALLCTRL --> DIALER
+    
+    %% Flow Connections - AI Processing
+    AUDSVC --> DSP
+    DSP --> FEAT
+    FEAT --> SENT
+    FEAT --> PATTERN
+    
+    LLMPROXY --> ROUTER
+    ROUTER --> SCREEN
+    ROUTER --> INSIGHT
+    ROUTER --> RISK
+    ROUTER --> BEHAV
+    
+    %% Flow Connections - Data Layer
+    AUDSVC --> CALLDB
+    PATTERN --> CALLDB
+    SCREEN --> LOANDB
+    INSIGHT --> METRICDB
+    RISK --> LOANDB
+    BEHAV --> METRICDB
+    ROUTER --> MODELDB
+    AUTHSVC --> USERDB
+    
+    %% Real-time Flow
+    DIALER --> CALL
+    DSP --> AUDIOVIS
+    SENT --> METRICS
+    PATTERN --> ALERTS
+    INSIGHT --> METRICS
+    RISK --> ALERTS
+    
+    %% External Integrations
+    API --> CRM
+    METRICDB --> REPORTING

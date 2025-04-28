@@ -1,0 +1,870 @@
+# .github/workflows/ci.yml - Core CI Workflow
+
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+  pull_request:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+
+# Define reusable job outputs
+outputs:
+  test_passed: ${{ jobs.test.outputs.tests_passed }}
+  security_passed: ${{ jobs.security.outputs.security_passed }}
+
+# Set defaults and permissions following principle of least privilege
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  # === QUALITY GATES ===
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # Allow status updates on PRs
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # Required for SonarQube
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Lint code
+        id: lint
+        run: npm run lint
+        
+      - name: Check types
+        id: typecheck
+        run: npm run typecheck
+        
+      - name: Check formatting
+        id: format
+        run: npm run format:check
+        
+      - name: SonarQube Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # === BUILD ===
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: [lint]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Build application
+        id: build
+        run: npm run build
+        
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts
+          path: dist/
+          retention-days: 7
+
+  # === TESTING ===
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    needs: [build]
+    outputs:
+      tests_passed: ${{ steps.test-results.outputs.passed }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Run unit tests
+        id: unit-tests
+        run: npm run test:unit -- --coverage
+        
+      - name: Run integration tests
+        id: integration-tests
+        run: npm run test:integration -- --coverage
+        
+      - name: Download build artifacts for E2E tests
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+          path: dist/
+          
+      - name: Run E2E tests
+        id: e2e-tests
+        run: npm run test:e2e
+        
+      - name: Upload test coverage
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-coverage
+          path: coverage/
+          
+      - name: Process test results
+        id: test-results
+        run: |
+          echo "passed=true" >> $GITHUB_OUTPUT
+
+  # === SECURITY SCANNING ===
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [build]
+    outputs:
+      security_passed: ${{ steps.security-result.outputs.passed }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Run dependency vulnerability scan
+        id: audit
+        run: npx audit-ci --moderate
+        continue-on-error: true # Log issues but don't fail workflow
+        
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'dynagendashv1'
+          path: '.'
+          format: 'HTML'
+          out: 'reports'
+          args: >
+            --failOnCVSS 7
+            --suppression ./.dependency-check-suppressions.xml
+            
+      - name: Build docker image for scan
+        id: docker-build
+        run: |
+          docker build -t dynagen-dashboard:${{ github.sha }} .
+          
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'dynagen-dashboard:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+          
+      - name: Set security gate results
+        id: security-result
+        run: |
+          # Evaluate all security scans and determine if we should proceed
+          if [[ "${{ steps.audit.outcome }}" == "failure" ]]; then
+            echo "Critical dependencies found in npm audit"
+            echo "passed=false" >> $GITHUB_OUTPUT
+          else
+            echo "passed=true" >> $GITHUB_OUTPUT
+          fi
+
+# .github/workflows/deploy-dev.yml - Development Deployment
+
+name: Deploy to Development
+
+on:
+  push:
+    branches: [ develop ]
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    branches: [develop]
+    types: [completed]
+
+permissions:
+  id-token: write # Required for AWS authentication
+  contents: read
+
+jobs:
+  deploy-dev:
+    name: Deploy to Development Environment
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    
+    environment:
+      name: development
+      url: https://dev.dashboard.dynagenlending.com
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+          path: dist/
+          
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          
+      - name: Deploy to S3
+        run: |
+          aws s3 sync dist/ s3://dynagen-dashboard-dev/ \
+            --delete \
+            --cache-control "max-age=31536000,public,immutable" \
+            --exclude "*.html" \
+            --exclude "config.js"
+            
+      - name: Deploy HTML and config with appropriate cache settings
+        run: |
+          aws s3 sync dist/ s3://dynagen-dashboard-dev/ \
+            --exclude "*" \
+            --include "*.html" \
+            --include "config.js" \
+            --cache-control "max-age=0,no-cache,no-store,must-revalidate"
+            
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.DEV_CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+            
+      - name: Deploy dev environment variables
+        run: |
+          # Deploy environment-specific configuration to SSM Parameter Store
+          aws ssm put-parameter \
+            --name "/dynagendashv1/dev/config" \
+            --type "SecureString" \
+            --value "$(cat .env.development)" \
+            --overwrite
+            
+      - name: Run smoke tests on deployed environment
+        run: |
+          npm ci
+          npx cypress run --spec "cypress/e2e/smoke/**/*.cy.js" \
+            --config baseUrl=https://dev.dashboard.dynagenlending.com
+            
+      - name: Notify deployment
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "Deployed to development environment: https://dev.dashboard.dynagenlending.com",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Development Deployment Complete* :rocket:\nEnvironment: <https://dev.dashboard.dynagenlending.com|Dev>"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Commit:*\n${{ github.sha }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Triggered by:*\n${{ github.actor }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+# .github/workflows/deploy-production.yml - Production Deployment
+
+name: Deploy to Production (Blue-Green)
+
+on:
+  workflow_dispatch:
+    inputs:
+      approval_comment:
+        description: 'Approval comment'
+        required: true
+        default: 'Approved for production release'
+
+permissions:
+  id-token: write # Required for AWS authentication
+  contents: read
+
+jobs:
+  deploy-green:
+    name: Deploy to Green Environment
+    runs-on: ubuntu-latest
+    environment: 
+      name: production-green
+      url: https://green.dashboard.dynagenlending.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Build production application
+        run: npm run build
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      
+      # Deploy to the Green environment
+      - name: Deploy to Green environment
+        run: |
+          aws s3 sync dist/ s3://dynagen-dashboard-green/ \
+            --delete \
+            --cache-control "max-age=31536000,public,immutable" \
+            --exclude "*.html" \
+            --exclude "config.js"
+            
+      - name: Deploy HTML and config with appropriate cache settings
+        run: |
+          aws s3 sync dist/ s3://dynagen-dashboard-green/ \
+            --exclude "*" \
+            --include "*.html" \
+            --include "config.js" \
+            --cache-control "max-age=0,no-cache,no-store,must-revalidate"
+            
+      - name: Invalidate Green CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.GREEN_CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+            
+      - name: Deploy production environment variables
+        run: |
+          # Deploy production-specific configuration
+          aws ssm put-parameter \
+            --name "/dynagendashv1/green/config" \
+            --type "SecureString" \
+            --value "$(cat .env.production)" \
+            --overwrite
+      
+      - name: Run smoke tests on Green environment
+        id: smoke-tests
+        run: |
+          npm ci
+          npx cypress run --spec "cypress/e2e/smoke/**/*.cy.js" \
+            --config baseUrl=https://green.dashboard.dynagenlending.com
+        
+      - name: Verify database compatibility
+        id: db-compatibility
+        run: |
+          # Run any migration verification tests
+          ./scripts/verify-db-compatibility.sh
+  
+  switch-to-green:
+    name: Switch Traffic to Green
+    needs: [deploy-green]
+    runs-on: ubuntu-latest
+    environment: 
+      name: production
+      url: https://dashboard.dynagenlending.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      
+      - name: Switch traffic to Green environment
+        id: switch-traffic
+        run: |
+          # Update CloudFormation stack to point to Green environment
+          aws cloudformation update-stack \
+            --stack-name dynagen-dashboard-routing \
+            --template-body file://infra/routing-green.yaml \
+            --parameters ParameterKey=ApprovalComment,ParameterValue="${{ github.event.inputs.approval_comment }}"
+      
+      - name: Verify production environment
+        id: verify-production
+        run: |
+          # Wait for CloudFormation stack update to complete
+          aws cloudformation wait stack-update-complete \
+            --stack-name dynagen-dashboard-routing
+          
+          # Run additional validation checks on the production URL
+          npm ci
+          npx cypress run --spec "cypress/e2e/critical-path/**/*.cy.js" \
+            --config baseUrl=https://dashboard.dynagenlending.com
+      
+      - name: Notify production deployment
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "Successfully deployed to production: https://dashboard.dynagenlending.com",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Production Deployment Complete* :rocket:\nEnvironment: <https://dashboard.dynagenlending.com|Production>"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Approval:*\n${{ github.event.inputs.approval_comment }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Triggered by:*\n${{ github.actor }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      
+      - name: Update Blue environment with new code for future deployments
+        run: |
+          # Update the old Blue environment with the new code for future deployments
+          aws s3 sync dist/ s3://dynagen-dashboard-blue/ --delete
+          aws cloudfront create-invalidation --distribution-id ${{ secrets.BLUE_CLOUDFRONT_DISTRIBUTION_ID }} --paths "/*"
+
+# .github/workflows/canary-deployment.yml - Canary Deployment
+
+name: Canary Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      canary_percentage:
+        description: 'Percentage of traffic to route to canary (1-50)'
+        required: true
+        default: '5'
+      observation_time:
+        description: 'Observation period in minutes (5-60)'
+        required: true
+        default: '30'
+
+permissions:
+  id-token: write # Required for AWS authentication
+  contents: read
+
+jobs:
+  deploy-canary:
+    name: Deploy and Monitor Canary
+    runs-on: ubuntu-latest
+    environment: production-canary
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Build production application
+        run: npm run build
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      
+      # Deploy to canary environment
+      - name: Deploy to canary environment
+        run: |
+          aws s3 sync dist/ s3://dynagen-dashboard-canary/ \
+            --delete \
+            --cache-control "max-age=31536000,public,immutable" \
+            --exclude "*.html" \
+            --exclude "config.js"
+            
+          aws s3 sync dist/ s3://dynagen-dashboard-canary/ \
+            --exclude "*" \
+            --include "*.html" \
+            --include "config.js" \
+            --cache-control "max-age=0,no-cache,no-store,must-revalidate"
+            
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CANARY_CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+      
+      # Update traffic routing for canary
+      - name: Update traffic routing for canary
+        run: |
+          aws cloudformation update-stack \
+            --stack-name dynagen-dashboard-routing \
+            --template-body file://infra/routing-canary.yaml \
+            --parameters ParameterKey=CanaryPercentage,ParameterValue=${{ github.event.inputs.canary_percentage }}
+      
+      - name: Notify canary deployment start
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "🐦 Canary Deployment: ${{ github.event.inputs.canary_percentage }}% of traffic now routed to new version. Observation period: ${{ github.event.inputs.observation_time }} minutes.",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*🐦 Canary Deployment Started*\n${{ github.event.inputs.canary_percentage }}% of traffic now routed to new version\nObservation period: ${{ github.event.inputs.observation_time }} minutes"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      
+      # Setup Prometheus metrics monitoring with automatic analysis
+      - name: Setup Prometheus monitoring for canary
+        run: |
+          # Create Prometheus recording rules for canary metrics
+          cat > canary-rules.yml << EOF
+          groups:
+          - name: canary
+            rules:
+            - record: canary:error_rate
+              expr: sum(rate(http_requests_total{environment="canary",status=~"5.."}[5m])) / sum(rate(http_requests_total{environment="canary"}[5m]))
+            - record: canary:latency_p95
+              expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{environment="canary"}[5m])) by (le))
+            - record: stable:error_rate
+              expr: sum(rate(http_requests_total{environment="production",status=~"5.."}[5m])) / sum(rate(http_requests_total{environment="production"}[5m]))
+            - record: stable:latency_p95
+              expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{environment="production"}[5m])) by (le))
+          EOF
+          
+          # Deploy recording rules
+          aws s3 cp canary-rules.yml s3://dynagen-monitoring/prometheus/recording-rules/canary-rules.yml
+      
+      # Monitor canary metrics
+      - name: Monitor canary metrics
+        id: monitor-canary
+        run: |
+          # Use Prometheus API to query metrics during observation period
+          END_TIME=$(date -d "+${{ github.event.inputs.observation_time }} minutes" +%s)
+          
+          # Initialize counters
+          ERROR_VIOLATIONS=0
+          LATENCY_VIOLATIONS=0
+          
+          while [[ $(date +%s) -lt $END_TIME ]]; do
+            # Query error rate comparison
+            CANARY_ERROR=$(curl -s "${{ secrets.PROMETHEUS_API }}/api/v1/query?query=canary:error_rate" | jq -r '.data.result[0].value[1]')
+            STABLE_ERROR=$(curl -s "${{ secrets.PROMETHEUS_API }}/api/v1/query?query=stable:error_rate" | jq -r '.data.result[0].value[1]')
+            
+            # Query latency comparison  
+            CANARY_LATENCY=$(curl -s "${{ secrets.PROMETHEUS_API }}/api/v1/query?query=canary:latency_p95" | jq -r '.data.result[0].value[1]')
+            STABLE_LATENCY=$(curl -s "${{ secrets.PROMETHEUS_API }}/api/v1/query?query=stable:latency_p95" | jq -r '.data.result[0].value[1]')
+            
+            # Check if canary metrics exceed thresholds compared to stable
+            if (( $(echo "$CANARY_ERROR > $STABLE_ERROR * 1.1" | bc -l) )); then
+              ERROR_VIOLATIONS=$((ERROR_VIOLATIONS + 1))
+              echo "Error rate violation detected: Canary=$CANARY_ERROR, Stable=$STABLE_ERROR"
+            fi
+            
+            if (( $(echo "$CANARY_LATENCY > $STABLE_LATENCY * 1.2" | bc -l) )); then
+              LATENCY_VIOLATIONS=$((LATENCY_VIOLATIONS + 1))
+              echo "Latency violation detected: Canary=$CANARY_LATENCY, Stable=$STABLE_LATENCY"
+            fi
+            
+            # Sleep and check again
+            sleep 60
+          done
+          
+          # Determine if canary is healthy based on violations
+          if [[ $ERROR_VIOLATIONS -gt 2 || $LATENCY_VIOLATIONS -gt 2 ]]; then
+            echo "CANARY_HEALTHY=false" >> $GITHUB_OUTPUT
+          else
+            echo "CANARY_HEALTHY=true" >> $GITHUB_OUTPUT
+          fi
+      
+      # Based on monitoring results, proceed with full deployment or rollback
+      - name: Promote or rollback canary
+        run: |
+          if [[ "${{ steps.monitor-canary.outputs.CANARY_HEALTHY }}" == "true" ]]; then
+            # Promote canary to production
+            aws cloudformation update-stack \
+              --stack-name dynagen-dashboard-routing \
+              --template-body file://infra/routing-production.yaml
+            
+            # Update the stable version
+            aws s3 sync s3://dynagen-dashboard-canary/ s3://dynagen-dashboard-production/ --delete
+            aws cloudfront create-invalidation \
+              --distribution-id ${{ secrets.PRODUCTION_CLOUDFRONT_DISTRIBUTION_ID }} \
+              --paths "/*"
+            
+            # Notify success
+            curl -X POST \
+              -H 'Content-type: application/json' \
+              --data '{"text":"✅ Canary promotion successful! New version is now live for all users."}' \
+              ${{ secrets.SLACK_WEBHOOK_URL }}
+          else
+            # Rollback canary
+            aws cloudformation update-stack \
+              --stack-name dynagen-dashboard-routing \
+              --template-body file://infra/routing-stable.yaml
+            
+            # Notify failure
+            curl -X POST \
+              -H 'Content-type: application/json' \
+              --data '{"text":"⚠️ Canary deployment showed issues. Rolled back to stable version."}' \
+              ${{ secrets.SLACK_WEBHOOK_URL }}
+          fi
+
+# .github/workflows/rollback.yml - Automated Rollback Workflow
+
+name: Rollback Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for rollback'
+        required: true
+
+permissions:
+  id-token: write # Required for AWS authentication
+  contents: read
+
+jobs:
+  rollback:
+    name: Rollback to Blue Environment
+    runs-on: ubuntu-latest
+    environment: production  # Requires approval
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      
+      - name: Switch back to previous environment
+        run: |
+          # Switch traffic back to the previous environment (Blue)
+          aws cloudformation update-stack \
+            --stack-name dynagen-dashboard-routing \
+            --template-body file://infra/routing-blue.yaml \
+            --parameters ParameterKey=RollbackReason,ParameterValue="${{ github.event.inputs.reason }}"
+      
+      - name: Verify rollback
+        run: |
+          # Wait for CloudFormation update to complete
+          aws cloudformation wait stack-update-complete \
+            --stack-name dynagen-dashboard-routing
+          
+          # Run validation checks on the rolled-back environment
+          npm ci
+          npx cypress run \
+            --spec "cypress/e2e/smoke/**/*.cy.js" \
+            --config baseUrl=https://dashboard.dynagenlending.com
+      
+      - name: Notify rollback
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "⚠️ ALERT: Production rollback performed. Reason: ${{ github.event.inputs.reason }}. Site has been reverted to previous stable version.",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*⚠️ PRODUCTION ROLLBACK PERFORMED*"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Reason:*\n${{ github.event.inputs.reason }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Triggered by:*\n${{ github.actor }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "Site has been reverted to previous stable version."
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+# .github/workflows/chaos-testing.yml - Automated Chaos Tests
+
+name: Chaos Engineering Tests
+
+on:
+  schedule:
+    - cron: '0 2 * * 2'  # Run every Tuesday at 2 AM
+  workflow_dispatch:     # Allow manual triggering
+  workflow_run:          # Run automatically after staging deployment
+    workflows: ["Deploy to Staging"]
+    branches: [main]
+    types: [completed]
+
+permissions:
+  id-token: write # Required for AWS authentication
+  contents: read
+
+jobs:
+  chaos-testing:
+    name: Run Chaos Engineering Tests
+    runs-on: ubuntu-latest
+    environment: staging
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Setup Chaos Toolkit
+        run: |
+          pip install chaostoolkit
+          pip install chaostoolkit-kubernetes
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      
+      - name: Configure K8s Access
+        run: |
+          aws eks update-kubeconfig --name dynagen-staging-cluster --region us-east-1
+      
+      - name: Run Service Disruption Test
+        run: |
+          # Randomly terminate pods to test auto-recovery
+          chaos run chaos-experiments/pod-failure.yaml
+      
+      - name: Run Network Partition Test
+        run: |
+          # Simulate network failures between services
+          chaos run chaos-experiments/network-partition.yaml
+      
+      - name: Run Load Spike Test
+        run: |
+          # Simulate sudden traffic spikes
+          chaos run chaos-experiments/load-spike.yaml
+      
+      - name: Generate Chaos Report
+        run: |
+          chaos report --export-format=json,html
+      
+      - name: Upload Chaos Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: chaos-report
+          path: chaos-report/
+      
+      - name: Notify Chaos Test Results
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "Chaos Engineering Test Results: Complete. Check the artifacts for details.",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Chaos Engineering Tests Completed* 🔥"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "Results have been uploaded as artifacts. Check the GitHub workflow for detailed reports."
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

@@ -1,0 +1,261 @@
+name: Database Password Rotation
+
+on:
+  # Triggered on a schedule (quarterly)
+  schedule:
+    - cron: '0 0 1 */3 *'  # Run at midnight on the 1st day of every 3rd month
+  
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to rotate password'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      db_host_type:
+        description: 'Database host type'
+        required: true
+        default: 'postgres'
+        type: choice
+        options:
+          - postgres
+          - supabase
+      dry_run:
+        description: 'Perform a dry run (no actual changes)'
+        required: false
+        default: false
+        type: boolean
+
+# Define permissions for GitHub Actions token
+permissions:
+  contents: read
+  id-token: write  # Needed for AWS authentication
+
+# Limit concurrent runs and cancel in-progress runs
+concurrency:
+  group: db-rotation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rotate-database-password:
+    name: Rotate Database Password
+    runs-on: ubuntu-latest
+    
+    # Define environment to use (for secrets)
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up environment variables
+        id: env-setup
+        run: |
+          # Determine environment from input or default
+          ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
+          echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+          
+          # Determine database host type
+          DB_HOST_TYPE="${{ github.event.inputs.db_host_type || 'postgres' }}"
+          echo "DB_HOST_TYPE=$DB_HOST_TYPE" >> $GITHUB_ENV
+          
+          # Set flag for dry run
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          echo "DRY_RUN=$DRY_RUN" >> $GITHUB_ENV
+          
+          # Set timestamp for logs and backups
+          TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+          
+          echo "::notice::Preparing password rotation for $ENVIRONMENT environment (DB Type: $DB_HOST_TYPE)"
+      
+      - name: Configure AWS credentials
+        if: ${{ env.DRY_RUN != 'true' }}
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Set up Postgres client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client jq
+      
+      - name: Download rotation script from S3 (production version)
+        if: ${{ env.DRY_RUN != 'true' }}
+        run: |
+          aws s3 cp s3://dynagen-${{ env.ENVIRONMENT }}-rotation-scripts/db-password-rotation.sh ./db-password-rotation.sh
+          chmod +x ./db-password-rotation.sh
+      
+      - name: Use local rotation script (dry run)
+        if: ${{ env.DRY_RUN == 'true' }}
+        run: |
+          chmod +x ./scripts/db-password-rotation.sh
+          cp ./scripts/db-password-rotation.sh ./db-password-rotation.sh
+      
+      - name: Create backup before rotation
+        if: ${{ env.DRY_RUN != 'true' && env.DB_HOST_TYPE == 'postgres' }}
+        run: |
+          echo "Creating database backup before rotation..."
+          
+          # Set up environment for pg_dump
+          export PGPASSWORD="${{ secrets.DB_PASSWORD }}"
+          
+          # Create backup
+          pg_dump -h "${{ secrets.DB_HOST }}" \
+            -U "${{ secrets.DB_USERNAME }}" \
+            -d "${{ secrets.DB_NAME }}" \
+            -p "${{ secrets.DB_PORT || '5432' }}" \
+            -f "backup_${{ env.ENVIRONMENT }}_${{ env.TIMESTAMP }}.sql"
+          
+          # Upload backup to S3
+          aws s3 cp "backup_${{ env.ENVIRONMENT }}_${{ env.TIMESTAMP }}.sql" \
+            "s3://dynagen-db-backups/${{ env.ENVIRONMENT }}/backup_${{ env.ENVIRONMENT }}_${{ env.TIMESTAMP }}.sql"
+          
+          echo "Backup created and uploaded to S3"
+      
+      - name: Execute password rotation script
+        id: rotation
+        if: ${{ env.DRY_RUN != 'true' }}
+        env:
+          # Database connection details
+          DB_HOST_TYPE: ${{ env.DB_HOST_TYPE }}
+          DB_SECRET_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_SECRET_DBNAME: ${{ secrets.DB_NAME }}
+          DB_SECRET_HOST: ${{ secrets.DB_HOST }}
+          DB_SECRET_PORT: ${{ secrets.DB_PORT || '5432' }}
+          DB_SECRET_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          
+          # Supabase-specific configuration (if applicable)
+          SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+          SUPABASE_MANAGEMENT_API_KEY: ${{ secrets.SUPABASE_MANAGEMENT_API_KEY }}
+          
+          # CI/CD platform information for secret updates
+          CICD_PLATFORM: "github"
+          CICD_SECRET_NAME: "DB_PASSWORD"
+          
+          # Slack webhook for notifications
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          # Execute the rotation script
+          ./db-password-rotation.sh 2>&1 | tee rotation_log.txt
+          
+          # Check if rotation was successful
+          if [ ${PIPESTATUS[0]} -eq 0 ]; then
+            echo "Rotation completed successfully"
+            echo "success=true" >> $GITHUB_OUTPUT
+            
+            # Extract and securely store the new password for updates
+            if grep -q "New password saved to" rotation_log.txt; then
+              NEW_PASSWORD_FILE=$(grep "New password saved to" rotation_log.txt | awk '{print $NF}')
+              if [ -f "$NEW_PASSWORD_FILE" ]; then
+                NEW_PASSWORD=$(cat "$NEW_PASSWORD_FILE")
+                echo "new_password_file=$NEW_PASSWORD_FILE" >> $GITHUB_OUTPUT
+                echo "::notice::New password file created at $NEW_PASSWORD_FILE"
+              fi
+            fi
+          else
+            echo "Rotation failed"
+            echo "success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+      
+      - name: Simulate rotation (dry run)
+        if: ${{ env.DRY_RUN == 'true' }}
+        run: |
+          echo "Performing DRY RUN - no actual password changes will be made"
+          echo "Would connect to database: ${{ secrets.DB_HOST }} as ${{ secrets.DB_USERNAME }}"
+          echo "Would generate a secure password"
+          echo "Would execute password change command for ${{ env.DB_HOST_TYPE }}"
+          echo "Would update secrets in GitHub"
+          echo "success=true" >> $GITHUB_OUTPUT
+      
+      - name: Update GitHub environment secrets
+        if: ${{ steps.rotation.outputs.success == 'true' && steps.rotation.outputs.new_password_file != '' && env.DRY_RUN != 'true' }}
+        run: |
+          echo "Manual step required: Update the DB_PASSWORD secret in GitHub"
+          echo "::warning::The database password has been rotated. Please update the DB_PASSWORD secret in GitHub environment secrets."
+          echo "The new password is available in ${{ steps.rotation.outputs.new_password_file }} but will be automatically deleted when this workflow completes."
+          
+          # This would ideally use GitHub CLI to update the secret, but that requires admin permissions
+          # If your GitHub Action has the necessary permissions, you could uncomment the following:
+          # if command -v gh &> /dev/null; then
+          #   NEW_PASSWORD=$(cat "${{ steps.rotation.outputs.new_password_file }}")
+          #   echo "$NEW_PASSWORD" | gh secret set DB_PASSWORD --env ${{ env.ENVIRONMENT }}
+          #   echo "Secret updated successfully using GitHub CLI"
+          # fi
+      
+      - name: Cleanup sensitive files
+        if: ${{ always() }}
+        run: |
+          # Remove any files containing passwords
+          if [ -f "rotation_log.txt" ]; then
+            rm rotation_log.txt
+          fi
+          
+          if [ -n "${{ steps.rotation.outputs.new_password_file }}" ] && [ -f "${{ steps.rotation.outputs.new_password_file }}" ]; then
+            rm "${{ steps.rotation.outputs.new_password_file }}"
+          fi
+          
+          # Remove any backup files
+          rm -f backup_*.sql
+      
+      - name: Notify rotation result
+        if: ${{ always() }}
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ steps.rotation.outputs.success == 'true' || env.DRY_RUN == 'true' ? '✅ Database Password Rotation Success' : '❌ Database Password Rotation Failed' }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Environment:*\n${{ env.ENVIRONMENT }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Database Type:*\n${{ env.DB_HOST_TYPE }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:*\n${{ env.DRY_RUN == 'true' ? 'Dry Run (No Changes)' : (steps.rotation.outputs.success == 'true' ? 'Password Rotated Successfully' : 'Rotation Failed') }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Triggered By:*\n${{ github.actor }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "Run <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_id }}> completed at ${{ env.TIMESTAMP }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
